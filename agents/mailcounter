@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# -*- encoding: utf-8 -*-
+"""mailcounter
+
+Usage:
+    mailcounter [options]...
+
+options:
+    --ignore-localhost      ignore mail to/from localhost (used for virus scanner)
+    --ignore-host=HOST      ignore mail to/from HOST regexp (used for virus scanner)
+    --rbl-is-spam           count rbl rejects as spam
+    --pflogsum              use alternative pflogsum algorithm
+ -s --status-file=FILE      filename of periodicaly updated results
+                            [default: /run/mailcounter.txt]
+ -S --since=DATETIME        count since specified time
+ -U --until=DATETIME        count until specified time
+ -D --no-daemon             not detach and does not become a daemon
+ -v --verbose               more verbose logging
+ -h --help      i           help usage
+
+"""
+
+__author__  = "Vaclav Ovsik <vaclav.ovsik@gmail.com>"
+__status__  = "beta"
+__version__ = "1.0"
+__date__    = "2023-11-06"
+
+
+from docopt import docopt
+import daemon
+import datetime
+import dateutil.parser
+import dateutil.tz
+import logging
+from logging.handlers import SysLogHandler
+import os
+import pprint
+import re
+import select
+import signal
+import sys
+from systemd import journal
+import time
+
+
+counter = { k: 0 for k in ('bounced', 'deferred', 'forwarded', 'greylisted',
+                           'received', 'rejected', 'sent', 'spam', 'virus') }
+
+def count(name, entry):
+    counter[name] = counter.get(name, 0) + 1
+
+def report(optargs):
+    logging.debug("counter=%s", counter)
+    fn = optargs['--status-file'][-1]
+    fnew = fn + '.new'
+    with open(fnew, 'x') as f:
+        for k in sorted(counter.keys()):
+            print(k, counter[k], file=f)
+    os.rename(fnew, fn)
+
+def event(optargs, entry):
+    if isinstance(entry['MESSAGE'], bytes):
+        entry['MESSAGE'] = entry['MESSAGE'].decode(errors="replace")
+    if optargs['--pflogsum']:
+        return event_pflogsumm(optargs, entry)
+    else:
+        return event_mailgraph(optargs, entry)
+
+deferred_id = {}
+
+def event_mailgraph(optargs, entry):
+    prog = entry['SYSLOG_IDENTIFIER']
+    msg = entry['MESSAGE']
+    if m := re.match(r"[^\s:]+", msg):
+        qid = m.group(0)
+    else:
+        qid = ''
+    if m := re.search(r"\bstatus=(\w+)\b", msg):
+        status = m.group(1)
+    else:
+        status = ''
+    if prog == 'postfix/smtp' or prog == 'postfix/local':
+        if status == 'sent':
+            deferred_id.pop(qid, None)
+            if optargs['--ignore-localhost'] \
+                    and re.search(r"\brelay=(?:local\b|[^\s\[]*\[127\.0\.0\.1\])", msg):
+                return
+            if optargs['--ignore-host']:
+                for hostre in optargs['--ignore-host']:
+                    if re.search(hostre, msg):
+                        return
+            if re.search(r"\(forwarded as \w+\)", msg):
+                count('forwarded', entry)
+                return
+            count('sent', entry)
+        elif status == 'bounced':
+            deferred_id.pop(qid, None)
+            count('bounced', entry)
+        elif status == 'deferred':
+            if qid in deferred_id:
+                deferred_id[qid] += 1
+            else:
+                deferred_id[qid] = 1
+                count('deferred', entry)
+        elif status == 'expired':
+            deferred_id.pop(qid, None)
+    elif prog == 'postfix/smtpd' or prog == 'postfix/postscreen':
+        if m := re.match(r"\w+: client=(.+?)(,|$)", msg):
+            client = m.group(1)
+            if optargs['--ignore-localhost'] \
+                and re.search(r"\[127\.0\.0\.1\]$", client):
+                return
+            if optargs['--ignore-host']:
+                for hostre in optargs['--ignore-host']:
+                    if re.search(hostre, client):
+                        return
+            count('received', entry)
+        elif optargs['--rbl-is-spam'] and \
+                re.match(r"(?:\w+: )?reject: .*: 5.* blocked using ", msg):
+            count('spam', entry)
+        elif re.search(r"Greylisted", msg):
+            count('greylisted', entry)
+        elif re.match(r"(?:\w+: )?reject: ", msg):
+            count('rejected', entry)
+        elif re.match(r"(?:\w+: )?milter-reject: ", msg):
+            if re.search(r"Blocked by SpamAssassin", msg):
+                count('spam', entry)
+            else:
+                count('rejected', entry)
+    elif prog == 'postfix/error':
+        if status == 'bounced':
+            count('bounced', entry)
+    elif prog == 'postfix/cleanup':
+        if re.search(r"\w+: (?:reject|discard): ", msg):
+            count('rejected', entry)
+    elif prog == 'amavis' or prog == 'amavisd':
+        if re.match(r"\([\w-]+\) (Passed|Blocked) SPAM(?:MY)?\b", msg):
+            if not re.search(r"\btag2=", msg):    # ignore new per-recipient log entry (2.2.0)
+                count('spam', entry)        # since amavisd-new-2004xxxx
+        elif re.match(r"\([\w-]+\) (Passed|Not-Delivered)\b.*\bquarantine spam", msg):
+            count('spam', entry); # amavisd-new-20030616 and earlier
+        elif re.match(r"\([\w-]+\) (Passed |Blocked )?INFECTED\b", msg):
+            if not re.search(r"\btag2=", msg):
+                count('virus', entry)       # Passed|Blocked inserted since 2004xxxx
+        elif re.match(r"\([\w-]+\) (Passed |Blocked )?BANNED\b", msg):
+            if not re.search(r"\btag2=", msg):
+                count('virus', entry)
+        elif re.match(r"Virus found\b", msg):
+            count('virus', entry)           # AMaViS 0.3.12 and amavisd-0.1
+
+def event_pflogsumm(optargs, entry):
+    prog = entry['SYSLOG_IDENTIFIER']
+    msg = entry['MESSAGE']
+
+    mcmd = re.match(r"postfix(?:/(?:smtps|submission))?/([^\[:]*)", prog) \
+            or re.match(r"((?:postfix)(?:-script)?)", prog)
+    if not mcmd:
+        return
+    mqid = re.match(r"([^:\s]+)", msg)
+    if not mqid:
+        return
+    cmd = mcmd.group(1)
+    qid = mqid.group(1)
+
+    # regexp rejects happen in "cleanup"
+    if cmd == "cleanup" and (m := re.match(r".*?\b((?:milter-)?reject|warning|hold|discard): (header|body|END-OF-MESSAGE) (.*)$", msg)):
+        (rejSubTyp, rejReas, rejRmdr) = m.groups()
+        if rejSubTyp == "reject" or rejSubTyp == "milter-reject":
+            count('rejected', entry)
+        elif rejSubTyp == "warning":
+            count('reject_warnings', entry)
+        elif rejSubTyp == "hold":
+                count('held', entry)
+        elif rejSubTyp == "discard":
+                count('discarded', entry)
+    elif qid == 'reject':
+        count('rejected', entry)
+    elif qid == 'reject_warning':
+        count('rejected', entry)
+    elif qid == 'hold':
+        count('rejected', entry)
+    elif qid == 'discard':
+        count('rejected', entry)
+    elif cmd == 'smtpd' or cmd == 'postscreen':
+        if re.match(r"\w+: client=(.+?)(,|$)", msg):
+            count('received', entry)
+        elif m := re.match(r"\w+: (reject(?:_warning)?|hold|discard): ", msg):
+            rejSubTyp = m.group(1)
+            if rejSubTyp == 'reject':
+                count('rejected', entry)
+            elif rejSubTyp == 'reject_warning':
+                count('rejected', entry)
+            elif rejSubTyp == 'hold':
+                count('rejected', entry)
+            elif rejSubTyp == 'discard':
+                count('rejected', entry)
+    elif m := re.search(r"to=<([^>]*)>, (?:orig_to=<[^>]*>, )?relay=([^,]+), (?:conn_use=[^,]+, )?delay=([^,]+), (?:delays=[^,]+, )?(?:dsn=[^,]+, )?status=(\S+)(.*)$", msg):
+        addr = m.group(1)
+        relay = m.group(2)
+        delay = m.group(3)
+        status = m.group(4)
+        toRmdr = m.group(5)
+
+        if status == 'sent':
+            # was it actually forwarded, rather than delivered?
+            if toRmdr.find("forwarded as ") > -1:
+                count('forwarded', entry)
+                return
+
+            count('sent', entry)
+        elif status == 'deferred':
+            if qid in deferred_id:
+                deferred_id[qid] += 1
+            else:
+                deferred_id[qid] = 1
+                count('deferred', entry)
+        elif status == 'bounced':
+            count('bounced', entry)
+    elif cmd == 'pickup' and re.search(r" (sender|uid)=", msg):
+        count('received', entry)
+
+terminate = False
+
+def sig_handler(signum, frame):
+    global terminate
+    terminate = True
+    logging.warning('signal %d caught', signum)
+
+def run(optargs):
+    j = journal.Reader()
+    j.log_level(journal.LOG_INFO)
+    j.add_match(SYSLOG_FACILITY=2)  # LOG_MAIL
+    tz = dateutil.tz.gettz()
+    if optargs['--since']:
+        since = dateutil.parser.parse(optargs['--since'][-1])
+        since = since.replace(tzinfo=tz)
+        j.seek_realtime(since)
+        counter['time_since'] = since.isoformat()
+    else:
+        j.seek_tail()
+        j.get_previous()
+        counter['time_since'] = datetime.datetime.now(tz=tz).isoformat()
+    if optargs['--until']:
+        until = dateutil.parser.parse(optargs['--until'][-1])
+        until = until.replace(tzinfo=tz)
+    else:
+        until = None
+    for entry in j:
+        if until and entry['__REALTIME_TIMESTAMP'] >= until:
+            break
+        if terminate:
+            break
+        event(optargs, entry)
+    else:
+        p = select.poll()
+        p.register(j, j.get_events())
+        while p.poll():
+            if terminate:
+                break
+            if j.process() != journal.APPEND:
+                continue
+            for entry in j:
+                if until and entry['__REALTIME_TIMESTAMP'] >= until:
+                    break
+                event(optargs, entry)
+            else:
+                report(optargs)
+                continue
+            break
+    report(optargs)
+
+def main():
+    optargs = docopt(__doc__, version = "mailcounter " + __version__)
+    if optargs['--verbose'] > 1:
+        level = logging.DEBUG
+    elif optargs['--verbose']:
+        level = logging.INFO
+    else:
+        level = logging.WARN
+    logging.basicConfig(level=level,
+            format="%(asctime)s %(levelname)s: %(message)s",
+            handlers=[ logging.StreamHandler(stream=sys.stderr) ])
+    logging.debug("optargs=%s", pprint.pformat(optargs))
+    if optargs['--pflogsum']:
+        if optargs['--ignore-localhost']:
+            logging.warning('--ignore-localhost not implemented for --pflogsum')
+        if optargs['--ignore-host']:
+            logging.warning('--ignore-host not implemented for --pflogsum')
+        if optargs['--rbl-is-spam']:
+            logging.warning('--rbl-is-spam not implemented for --pflogsum')
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+    if optargs['--no-daemon']:
+        run(optargs)
+    else:
+        with daemon.DaemonContext():
+            signal.signal(signal.SIGINT, sig_handler)
+            signal.signal(signal.SIGTERM, sig_handler)
+            logging.basicConfig(level=level,
+                    format="%(filename)s: %(levelname)s: %(message)s",
+                    handlers=[ SysLogHandler(facility=SysLogHandler.LOG_DAEMON, address='/dev/log') ],
+                    force=True)
+            logging.info("mailcounter daemon started")
+            run(optargs)
+            logging.info("mailcounter daemon stopped")
+
+main()

@@ -1,0 +1,11 @@
+[Unit]
+Description=mailcounter - systemd-journal log analyzer for Postfix
+After=
+
+[Service]
+Nice=10
+Type=exec
+ExecStart=/usr/local/bin/mailcounter -v --ignore-localhost
+
+[Install]
+WantedBy=multi-user.target

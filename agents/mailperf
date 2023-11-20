@@ -1,0 +1,6 @@
+#!/bin/sh
+MAILCOUNTER_STATUS_FILE=/run/mailcounter.txt
+if test -f "$MAILCOUNTER_STATUS_FILE"; then
+	echo "<<<mailperf>>>"
+	cat "$MAILCOUNTER_STATUS_FILE"
+fi
