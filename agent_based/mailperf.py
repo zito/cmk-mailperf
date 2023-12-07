@@ -3,10 +3,16 @@
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
 from collections import defaultdict
-import time
-from typing import Any, Iterable, Iterator, Mapping, NamedTuple, Optional, Sequence
+from typing import Any, Mapping, Optional
 
-from .agent_based_api.v1 import check_levels, get_rate, get_value_store, register, Service
+from .agent_based_api.v1 import (
+    check_levels,
+    get_rate,
+    get_value_store,
+    GetRateError,
+    register,
+    Service,
+)
 from .agent_based_api.v1.type_defs import CheckResult, DiscoveryResult, StringTable
 
 Section = Mapping[str, Any]
@@ -32,6 +38,8 @@ def parse(string_table: StringTable) -> Optional[Section]:
     for k, v in string_table:
         if k.startswith('time_'):
             section[k] = v
+        elif k == 'current-timestamp':
+            section[k] = float(v)
         else:
             section[k] = int(v)
     return section
@@ -50,11 +58,17 @@ def check_stat(params: Mapping[str, Any], section: Section) -> CheckResult:
     if 'time_since' not in store or store['time_since'] != section['time_since']:
         store.clear()
         store['time_since'] = section['time_since']
+    ts = section['current-timestamp']
+    exc = None
     for k, v in section.items():
-        if k.startswith('time_'):
+        if k.startswith('time_') or k == 'current-timestamp':
             continue
         if v is not None:
-            rate = get_rate(store, k, time.time(), v) * 60     # msgs / min
+            try:
+                rate = get_rate(store, k, ts, v) * 60     # msgs / min
+            except GetRateError as e:
+                exc = e
+                continue
             yield from check_levels(
                     rate,
                     levels_upper=params.get("levels_"+k),
@@ -62,6 +76,8 @@ def check_stat(params: Mapping[str, Any], section: Section) -> CheckResult:
                     render_func=lambda v: f"{v:.1f} msg/min",
                     label=k,
                 )
+    if exc:
+        raise exc
 
 
 register.check_plugin(

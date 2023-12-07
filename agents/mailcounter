@@ -53,6 +53,7 @@ def report(optargs):
     logging.debug("counter=%s", counter)
     fn = optargs['--status-file'][-1]
     fnew = fn + '.new'
+    counter['current-timestamp'] = time.time()
     with open(fnew, 'x') as f:
         for k in sorted(counter.keys()):
             print(k, counter[k], file=f)
