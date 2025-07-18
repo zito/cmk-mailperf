@@ -2,18 +2,22 @@
 # Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
-from collections import defaultdict
+
 from typing import Any, Mapping, Optional
 
-from .agent_based_api.v1 import (
+from cmk.agent_based.v2 import ( 
+    AgentSection,
+    CheckPlugin, 
+    CheckResult, 
     check_levels,
+    DiscoveryResult, 
+    GetRateError,
     get_rate,
     get_value_store,
-    GetRateError,
-    register,
-    Service,
+    Service, 
+    StringTable,
 )
-from .agent_based_api.v1.type_defs import CheckResult, DiscoveryResult, StringTable
+
 
 Section = Mapping[str, Any]
 
@@ -45,7 +49,10 @@ def parse(string_table: StringTable) -> Optional[Section]:
     return section
 
 
-register.agent_section(name="mailperf", parse_function=parse)
+agent_section_mailperf = AgentSection(
+    name="mailperf",
+    parse_function=parse,
+)
 
 
 def discovery_stat(section: Section) -> DiscoveryResult:
@@ -73,14 +80,14 @@ def check_stat(params: Mapping[str, Any], section: Section) -> CheckResult:
                     rate,
                     levels_upper=params.get("levels_"+k),
                     metric_name=k,
-                    render_func=lambda v: f"{v:.1f} msg/min",
+                    render_func=lambda v: f"{v:.1f} /min",
                     label=k,
                 )
     if exc:
         raise exc
 
 
-register.check_plugin(
+check_plugin_mailperf = CheckPlugin( 
     name="mailperf",
     service_name="Mail rate",
     discovery_function=discovery_stat,
